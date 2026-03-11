@@ -156,18 +156,51 @@ if do_payment: steps_list.append("支付")
 tab_run, tab_accounts, tab_history = st.tabs(["▶ 执行", "📋 账号", "📊 历史"])
 
 with tab_run:
-    # 流程链
-    if steps_list:
-        st.caption("流程: " + " → ".join(steps_list))
-
     bc1, bc2 = st.columns([3, 1])
     with bc1:
         run_btn = st.button("🚀 开始执行", disabled=st.session_state.running or not steps_list, use_container_width=True, type="primary")
     with bc2:
-        if st.button("🗑️ 清空日志", use_container_width=True):
+        if st.button("🗑️ 清空", use_container_width=True):
             st.session_state.log_buffer = []
             st.session_state.result = None
             st.rerun()
+
+    # ── 节点式流程图 ──
+    def render_pipeline(nodes):
+        """渲染节点流程图 - 横向排列"""
+        cols = st.columns(len(nodes))
+        for i, (col, node) in enumerate(zip(cols, nodes)):
+            name, status = node
+            if status == "done":
+                icon, color = "✅", "#2ecc71"
+            elif status == "running":
+                icon, color = "⏳", "#f39c12"
+            elif status == "error":
+                icon, color = "❌", "#e74c3c"
+            elif status == "skip":
+                icon, color = "⏭️", "#7f8c8d"
+            else:
+                icon, color = "⬜", "#555"
+            col.markdown(
+                f'<div style="text-align:center;padding:12px 6px;border:2px solid {color};'
+                f'border-radius:10px;background:rgba(0,0,0,0.2);min-height:70px;'
+                f'display:flex;flex-direction:column;justify-content:center;">'
+                f'<div style="font-size:24px;">{icon}</div>'
+                f'<div style="font-size:13px;color:{color};font-weight:600;margin-top:4px;">{name}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # 构建节点列表
+    all_nodes = [
+        ("邮箱创建", "register" if do_register else None),
+        ("账号注册", "register" if do_register else None),
+        ("Checkout", "checkout" if do_checkout else None),
+        ("指纹获取", "fingerprint" if do_checkout else None),
+        ("卡片Token", "tokenize" if do_payment else None),
+        ("确认支付", "confirm" if do_payment else None),
+    ]
+    active_nodes = [(name, key) for name, key in all_nodes if key is not None]
 
     if run_btn:
         st.session_state.running = True
@@ -175,12 +208,18 @@ with tab_run:
         st.session_state.result = None
         init_logging()
 
-        status = st.empty()
-        pbar = st.progress(0)
+        pipeline_area = st.empty()
         log_area = st.empty()
 
         store = ResultStore(output_dir=OUTPUT_DIR)
         rd = {"success": False, "error": "", "email": "", "steps": {}}
+        node_status = {key: "pending" for _, key in active_nodes}
+
+        def refresh_pipeline():
+            with pipeline_area.container():
+                render_pipeline([(name, node_status.get(key, "pending")) for name, key in active_nodes])
+
+        refresh_pipeline()
 
         try:
             cfg = Config()
@@ -201,69 +240,80 @@ with tab_run:
 
             # ── 注册 ──
             if do_register:
-                status.info("⏳ 注册中...")
-                pbar.progress(5)
+                node_status["register"] = "running"
+                refresh_pipeline()
                 mp = MailProvider(worker_domain=cfg.mail.worker_domain, admin_token=cfg.mail.admin_token, email_domain=cfg.mail.email_domain)
                 af = AuthFlow(cfg)
                 auth_result = af.run_register(mp)
                 rd["email"] = auth_result.email
                 rd["steps"]["register"] = "✅"
-                pbar.progress(40)
-                status.success(f"✅ 注册完成: {auth_result.email}")
+                node_status["register"] = "done"
+                refresh_pipeline()
                 store.save_credentials(auth_result.to_dict())
                 store.append_credentials_csv(auth_result.to_dict())
-                log_area.code("\n".join(st.session_state.log_buffer[-80:]), language="log")
+                log_area.code("\n".join(st.session_state.log_buffer[-60:]), language="log")
 
             # ── Checkout ──
             if do_checkout:
                 if not auth_result:
                     raise RuntimeError("需先注册或提供凭证")
-                status.info("⏳ 创建 Checkout Session...")
-                pbar.progress(50)
+                node_status["checkout"] = "running"
+                refresh_pipeline()
                 cfg.billing.email = auth_result.email
                 pf = PaymentFlow(cfg, auth_result)
                 if af:
                     pf.session = af.session
 
                 cs_id = pf.create_checkout_session()
+                rd["checkout_session_id"] = cs_id
+                rd["steps"]["checkout"] = "✅"
+                node_status["checkout"] = "done"
+                refresh_pipeline()
+                log_area.code("\n".join(st.session_state.log_buffer[-60:]), language="log")
+
+                node_status["fingerprint"] = "running"
+                refresh_pipeline()
                 pf.fetch_stripe_fingerprint()
                 pf.extract_stripe_pk(pf.checkout_url)
-                rd["checkout_session_id"] = cs_id
                 rd["stripe_pk"] = (pf.stripe_pk[:30] + "...") if pf.stripe_pk else ""
-                rd["steps"]["checkout"] = "✅"
                 rd["steps"]["fingerprint"] = "✅"
-                pbar.progress(70)
-                status.success(f"✅ Checkout: {cs_id[:40]}...")
-                log_area.code("\n".join(st.session_state.log_buffer[-80:]), language="log")
+                node_status["fingerprint"] = "done"
+                refresh_pipeline()
+                log_area.code("\n".join(st.session_state.log_buffer[-60:]), language="log")
 
                 # ── 支付 ──
                 if do_payment:
-                    status.info("⏳ 提交支付...")
-                    pbar.progress(80)
+                    node_status["tokenize"] = "running"
+                    refresh_pipeline()
                     pf.payment_method_id = pf.create_payment_method()
                     rd["steps"]["tokenize"] = "✅"
-                    pbar.progress(90)
+                    node_status["tokenize"] = "done"
+                    refresh_pipeline()
+                    log_area.code("\n".join(st.session_state.log_buffer[-60:]), language="log")
+
+                    node_status["confirm"] = "running"
+                    refresh_pipeline()
                     pay = pf.confirm_payment(cs_id)
                     rd["confirm_status"] = pay.confirm_status
                     rd["confirm_response"] = pay.confirm_response
                     rd["success"] = pay.success
                     rd["error"] = pay.error
                     rd["steps"]["confirm"] = "✅" if pay.success else f"❌ {pay.error}"
+                    node_status["confirm"] = "done" if pay.success else "error"
+                    refresh_pipeline()
                 else:
                     rd["success"] = True
             elif do_register:
                 rd["success"] = True
 
-            pbar.progress(100)
-            if rd["success"]:
-                status.success(f"✅ 全部完成! {rd.get('email', '')}")
-            else:
-                status.warning(f"⚠️ {rd.get('error', '')}")
-
         except Exception as e:
             rd["error"] = str(e)
             st.session_state.log_buffer.append(f"EXCEPTION:\n{traceback.format_exc()}")
-            status.error(f"❌ {e}")
+            # 标记当前 running 的节点为 error
+            for k in node_status:
+                if node_status[k] == "running":
+                    node_status[k] = "error"
+            refresh_pipeline()
 
         st.session_state.result = rd
         st.session_state.running = False
@@ -278,6 +328,12 @@ with tab_run:
         except Exception:
             pass
 
+        # 最终结果
+        if rd["success"]:
+            st.success(f"✅ 全部完成! {rd.get('email', '')}")
+        else:
+            st.error(f"❌ {rd.get('error', '')}")
+
         log_area.code("\n".join(st.session_state.log_buffer[-200:]), language="log")
 
     elif st.session_state.log_buffer:
@@ -286,16 +342,22 @@ with tab_run:
     # ── 结果卡片 ──
     if st.session_state.result and not run_btn:
         r = st.session_state.result
+        # 显示已完成的流程图
+        if r.get("steps"):
+            node_status_saved = {}
+            for _, key in active_nodes:
+                if key in r["steps"]:
+                    node_status_saved[key] = "done" if "✅" in r["steps"].get(key, "") else "error"
+                else:
+                    node_status_saved[key] = "pending"
+            render_pipeline([(name, node_status_saved.get(key, "pending")) for name, key in active_nodes])
+
         st.divider()
         cols = st.columns(4)
         cols[0].metric("邮箱", r.get("email") or "-")
         cols[1].metric("Checkout", (r.get("checkout_session_id", "")[:20] + "...") if r.get("checkout_session_id") else "-")
         cols[2].metric("Confirm", r.get("confirm_status") or "-")
         cols[3].metric("状态", "成功" if r.get("success") else "失败")
-
-        if r.get("steps"):
-            step_text = "  |  ".join(f"{k}: {v}" for k, v in r["steps"].items())
-            st.caption(step_text)
 
         with st.expander("完整 JSON 结果", expanded=False):
             st.json(r)
