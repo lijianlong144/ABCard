@@ -26,6 +26,7 @@ class CaptchaSolver:
         proxy: str = "",
         timeout: int = 120,
         poll_interval: int = 5,
+        is_invisible: bool = True,
     ) -> Optional[dict]:
         """
         提交 hCaptcha 任务并等待结果。
@@ -38,7 +39,7 @@ class CaptchaSolver:
                 "websiteURL": site_url,
                 "websiteKey": site_key,
                 "isEnterprise": True,
-                "isInvisible": True,
+                "isInvisible": is_invisible,
             }
             # 解析代理格式: socks5://user:pass@host:port 或 http://host:port
             task["proxyType"] = "socks5" if "socks" in proxy.lower() else "http"
@@ -62,7 +63,7 @@ class CaptchaSolver:
                 "websiteURL": site_url,
                 "websiteKey": site_key,
                 "isEnterprise": True,
-                "isInvisible": True,
+                "isInvisible": is_invisible,
             }
         if rqdata:
             task["enterprisePayload"] = {"rqdata": rqdata}

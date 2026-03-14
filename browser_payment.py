@@ -187,7 +187,6 @@ class BrowserPayment:
                 chrome_path,
                 f"--remote-debugging-port={cdp_port}",
                 "--no-sandbox",
-                "--disable-gpu",
                 "--disable-dev-shm-usage",
                 "--no-first-run",
                 "--no-default-browser-check",
@@ -197,6 +196,15 @@ class BrowserPayment:
                 f"--window-size=1366,900",
                 f"--user-data-dir={user_data_dir}",
             ]
+            # 非 headless 模式: 使用 SwiftShader 提供软件 GPU (Xvfb 无硬件 GPU)
+            if not self.headless:
+                chrome_args.extend([
+                    "--use-gl=angle",
+                    "--use-angle=swiftshader-webgl",
+                    "--enable-unsafe-swiftshader",
+                ])
+            else:
+                chrome_args.append("--disable-gpu")
             if self.proxy:
                 chrome_args.append(f"--proxy-server={self.proxy}")
             if self.headless:
@@ -231,8 +239,45 @@ class BrowserPayment:
                 page = context.new_page()
                 page.set_default_timeout(timeout * 1000)
 
+                # 如果 headless, 通过 CDP 覆盖 User-Agent 和其他标记
+                if self.headless:
+                    cdp_session = context.new_cdp_session(page)
+                    cdp_session.send("Network.setUserAgentOverride", {
+                        "userAgent": (
+                            "Mozilla/5.0 (X11; Linux x86_64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/145.0.0.0 Safari/537.36"
+                        ),
+                        "platform": "Linux",
+                    })
+                    # 覆盖 navigator.webdriver 等标记
+                    cdp_session.send("Page.addScriptToEvaluateOnNewDocument", {
+                        "source": """
+                            Object.defineProperty(navigator, 'webdriver', {get: () => false});
+                            Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                            Object.defineProperty(navigator, 'languages', {get: () => ['en-GB','en-US','en']});
+                            window.chrome = {runtime: {}, loadTimes: function(){}, csi: function(){}};
+                        """
+                    })
+                    logger.info("[Browser] headless 反检测补丁已应用")
+
                 # 监听浏览器 console 日志
                 page.on("console", lambda msg: logger.info(f"[Browser Console] {msg.text}"))
+
+                # 通过 Playwright response 事件监听 m.stripe.com/6 响应, 提取 guid
+                captured_guid = {"value": ""}
+
+                def on_response(response):
+                    if "m.stripe.com/6" in response.url:
+                        try:
+                            data = response.json()
+                            if data.get("guid"):
+                                captured_guid["value"] = data["guid"]
+                                logger.info(f"[Intercept] guid captured: {data['guid'][:20]}...")
+                        except Exception as e:
+                            logger.debug(f"[Intercept] m.stripe.com/6 parse failed: {e}")
+
+                page.on("response", on_response)
 
                 # 拦截 checkout.stripe.com 域, 注入我们的支付页面
                 # checkout.stripe.com 有 CORS 权限访问 api.stripe.com
@@ -258,34 +303,93 @@ class BrowserPayment:
 
                 # 模拟用户行为 (提升指纹质量)
                 self._simulate_human_behavior(page)
-                time.sleep(random.uniform(2.0, 4.0))
-
-                # 等待 m.stripe.com/6 指纹采集完成
-                logger.info("[Browser] 等待指纹采集...")
-                time.sleep(random.uniform(3.0, 5.0))
+                time.sleep(random.uniform(1.0, 2.0))
 
                 # 填写 Stripe Elements iframe 中的卡信息
+                # 点击 iframe 会触发 m.stripe.com/6 指纹采集
                 logger.info("[Browser] 填写卡信息到 Stripe Elements...")
                 self._fill_stripe_elements(page, card_number, card_exp_month, card_exp_year, card_cvc)
 
                 time.sleep(random.uniform(1.0, 2.0))
 
+                # 等待 guid 捕获 (m.stripe.com/6 在 iframe 获得焦点后~20秒后才发起)
+                logger.info("[Browser] 等待 guid 捕获...")
+                guid_wait_start = time.time()
+                while not captured_guid["value"] and (time.time() - guid_wait_start) < 25:
+                    time.sleep(0.3)
+
+                if captured_guid["value"]:
+                    page.evaluate(f'window.__stripeGuid = "{captured_guid["value"]}"')
+                    logger.info(f"[Browser] guid 已注入: {captured_guid['value'][:30]}...")
+                else:
+                    logger.warning("[Browser] guid 未捕获, confirm 将不含 guid")
+
                 # 截图
                 page.screenshot(path="test_outputs/browser_stripe_loaded.png")
 
-                # 执行支付流程
+                # 执行支付流程 (异步) + 自动点击 hCaptcha
                 logger.info("[Browser] 执行支付流程...")
-                result = page.evaluate("""
-                    async () => {
+
+                # 用 addScriptTag 启动异步支付 (不会阻塞 Python)
+                page.add_script_tag(content="""
+                    window.__payResult = null;
+                    window.__payDone = false;
+                    (async () => {
                         try {
-                            return await window.__runPayment();
+                            window.__payResult = await window.__runPayment();
                         } catch(e) {
-                            return { success: false, error: e.message || String(e) };
+                            window.__payResult = { success: false, error: e.message || String(e) };
                         }
-                    }
+                        window.__payDone = true;
+                    })();
                 """)
 
+                # 在等待支付结果的同时, 监控并自动点击 hCaptcha
+                logger.info("[Browser] 等待支付结果 (同时监控 hCaptcha)...")
+                hcaptcha_clicked = False
+                pay_start = time.time()
+
+                while (time.time() - pay_start) < timeout:
+                    # 检查支付是否完成
+                    try:
+                        done = page.evaluate("window.__payDone === true")
+                        if done:
+                            break
+                    except Exception:
+                        pass
+
+                    # 尝试找到并点击 hCaptcha checkbox
+                    if not hcaptcha_clicked:
+                        try:
+                            hcaptcha_clicked = self._try_click_hcaptcha(page)
+                            if hcaptcha_clicked:
+                                logger.info("[Browser] hCaptcha checkbox 已自动点击!")
+                        except Exception as e:
+                            logger.debug(f"[Browser] hCaptcha check error: {e}")
+
+                    time.sleep(0.5)
+
+                # 获取结果
+                result = page.evaluate("window.__payResult")
+                if result is None:
+                    result = {"success": False, "error": "Payment timeout"}
+
                 logger.info(f"[Browser] 支付结果: {json.dumps(result, default=str)[:500]}")
+
+                # 如果 hCaptcha 超时, 尝试用打码平台解决
+                if result.get("step") == "hcaptcha_timeout" and result.get("hcaptcha_challenge"):
+                    challenge = result["hcaptcha_challenge"]
+                    # 记录当前所有 frame URL (帮助诊断 hCaptcha site_url)
+                    frame_urls = [f.url for f in page.frames]
+                    logger.info(f"[Browser] 所有 frame URLs: {frame_urls}")
+                    logger.info("[Browser] hCaptcha challenge, 尝试打码平台...")
+                    solve_result = self._solve_hcaptcha_via_service(
+                        page=page,
+                        challenge=challenge,
+                        stripe_pk=stripe_pk,
+                    )
+                    if solve_result:
+                        result = solve_result
 
                 # 截图结果
                 page.screenshot(path="test_outputs/browser_stripe_result.png")
@@ -366,8 +470,26 @@ class BrowserPayment:
     <script>
         window.__stripeReady = false;
         window.__elementsReady = false;
+        window.__stripeGuid = '';
 
         const CONFIG = {config};
+
+        // 拦截 postMessage 捕获 Stripe m.stripe.com/6 iframe 返回的 guid
+        (function() {{
+            const origPostMessage = window.addEventListener;
+            window.addEventListener('message', function(e) {{
+                try {{
+                    const data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+                    // Stripe m.stripe.com iframe 通过 postMessage 发回 guid/muid/sid
+                    if (data && data.guid) {{
+                        window.__stripeGuid = data.guid;
+                        console.log('[Fingerprint] guid from postMessage: ' + data.guid.substring(0, 20));
+                    }}
+                    if (data && data.muid) window.__stripeMuid = data.muid;
+                    if (data && data.sid) window.__stripeSid = data.sid;
+                }} catch(e) {{}}
+            }}, true);
+        }})();
 
         // 初始化 Stripe.js + Elements
         const stripe = Stripe(CONFIG.pk);
@@ -549,11 +671,13 @@ class BrowserPayment:
                     acc[k] = v;
                     return acc;
                 }}, {{}});
-                const muid = cookies['__stripe_mid'] || '';
-                const sid = cookies['__stripe_sid'] || '';
+                const muid = window.__stripeMuid || cookies['__stripe_mid'] || '';
+                const sid = window.__stripeSid || cookies['__stripe_sid'] || '';
+                const guid = window.__stripeGuid || '';
+                if (guid) confirmBody.append('guid', guid);
                 if (muid) confirmBody.append('muid', muid);
                 if (sid) confirmBody.append('sid', sid);
-                console.log('[Pay] fingerprints: muid=' + muid.substring(0,12) + ' sid=' + sid.substring(0,12));
+                console.log('[Pay] fingerprints: guid=' + guid.substring(0,12) + ' muid=' + muid.substring(0,12) + ' sid=' + sid.substring(0,12));
 
                 const confirmResp = await fetch('https://api.stripe.com/v1/payment_pages/' + CONFIG.csId + '/confirm', {{
                     method: 'POST',
@@ -585,20 +709,65 @@ class BrowserPayment:
                     const nextAction = pi.next_action || {{}};
                     const sdkInfo = nextAction.use_stripe_sdk || {{}};
                     const challengeType = sdkInfo.type || '';
+                    console.log('[Pay] next_action: ' + JSON.stringify(nextAction).substring(0, 500));
 
                     if (challengeType === 'intent_confirmation_challenge') {{
-                        console.log('[Pay] hCaptcha triggered! Calling handleNextAction...');
-                        statusEl.textContent = 'Step 4: hCaptcha triggered — handleNextAction()...';
-
                         const piClientSecret = pi.client_secret;
-                        if (!piClientSecret) {{
-                            return {{ success: false, error: 'No PI client_secret', step: 'hcaptcha' }};
+                        const stripeJsInfo = sdkInfo.stripe_js || {{}};
+                        // stripe_js 可能是对象或字符串
+                        const hcSiteKey = stripeJsInfo.site_key || sdkInfo.hcaptcha_site_key || '';
+                        const hcRqdata = stripeJsInfo.rqdata || sdkInfo.hcaptcha_rqdata || '';
+                        const verificationUrl = stripeJsInfo.verification_url || '';
+
+                        console.log('[Pay] hCaptcha challenge: siteKey=' + hcSiteKey + ' rqdata=' + (hcRqdata || '').substring(0,30) + ' verifyUrl=' + verificationUrl);
+
+                        // 存储 challenge 信息供 Python 使用
+                        window.__hcaptchaChallenge = {{
+                            pi_client_secret: piClientSecret,
+                            site_key: hcSiteKey,
+                            rqdata: hcRqdata,
+                            verification_url: verificationUrl,
+                            pi_id: pi.id || '',
+                        }};
+
+                        // headless 模式: 跳过 handleNextAction, 直接返回 challenge 信息给 Python 处理
+                        if (window.__skipHandleNextAction) {{
+                            console.log('[Pay] headless 模式: 跳过 handleNextAction, 由 Python 处理 hCaptcha');
+                            return {{
+                                success: false,
+                                error: 'hcaptcha_challenge_detected',
+                                step: 'hcaptcha_timeout',
+                                pi_status: piStatus,
+                                hcaptcha_challenge: window.__hcaptchaChallenge,
+                            }};
                         }}
 
-                        console.log('[Pay] handleNextAction starting... (this may take a while)');
-                        const handleResult = await stripe.handleNextAction({{
+                        // headed 模式: 用 handleNextAction 自动解决 (有30秒超时)
+                        if (!piClientSecret) {{
+                            return {{ success: false, error: 'No PI client_secret', step: 'hcaptcha', hcaptcha_challenge: window.__hcaptchaChallenge }};
+                        }}
+
+                        console.log('[Pay] handleNextAction starting... (timeout=30s)');
+                        // 加超时: 如果 60s 内 handleNextAction 没完成, 自动放弃
+                        const handlePromise = stripe.handleNextAction({{
                             clientSecret: piClientSecret,
                         }});
+                        const timeoutPromise = new Promise((_, reject) =>
+                            setTimeout(() => reject(new Error('handleNextAction_timeout')), 60000)
+                        );
+                        let handleResult;
+                        try {{
+                            handleResult = await Promise.race([handlePromise, timeoutPromise]);
+                        }} catch(timeoutErr) {{
+                            console.log('[Pay] handleNextAction timed out (60s)');
+                            return {{
+                                success: false,
+                                error: 'hcaptcha_timeout',
+                                step: 'hcaptcha_timeout',
+                                pi_status: piStatus,
+                                hcaptcha_challenge: window.__hcaptchaChallenge,
+                            }};
+                        }}
                         console.log('[Pay] handleNextAction completed, error=' + (handleResult.error?.message || 'none'));
 
                         if (handleResult.error) {{
@@ -644,6 +813,181 @@ class BrowserPayment:
     </script>
 </body>
 </html>"""
+
+    def _solve_hcaptcha_via_service(self, page, challenge: dict, stripe_pk: str) -> dict | None:
+        """
+        当 handleNextAction 超时 (headless 模式), 用打码平台解决 hCaptcha,
+        然后通过 Stripe verify_challenge API 提交 token。
+        """
+        api_site_key = challenge.get("site_key", "")
+        rqdata = challenge.get("rqdata", "")
+        verification_url = challenge.get("verification_url", "")
+        pi_client_secret = challenge.get("pi_client_secret", "")
+        pi_id = challenge.get("pi_id", "")
+
+        if not api_site_key or not verification_url:
+            logger.error(f"[Solver] challenge 参数不完整: site_key={bool(api_site_key)} verifyUrl={bool(verification_url)}")
+            return None
+
+        # 从浏览器 frame 中提取真实的 hCaptcha sitekey (可能与 API 返回的不同)
+        real_site_key = api_site_key
+        real_site_url = "https://b.stripecdn.com"  # hCaptcha host domain from frame analysis
+        try:
+            for frame in page.frames:
+                url = frame.url
+                if "newassets.hcaptcha.com" in url and "sitekey=" in url:
+                    import urllib.parse
+                    fragment = url.split("#", 1)[-1] if "#" in url else ""
+                    params = dict(p.split("=", 1) for p in fragment.split("&") if "=" in p)
+                    sk = params.get("sitekey", "")
+                    origin = urllib.parse.unquote(params.get("origin", ""))
+                    if sk and sk != api_site_key:
+                        real_site_key = sk
+                        logger.info(f"[Solver] 使用 frame sitekey={real_site_key} (不同于 API sitekey)")
+                    if origin:
+                        real_site_url = origin
+                    logger.info(f"[Solver] hCaptcha frame: sitekey={real_site_key[:20]}... origin={real_site_url}")
+                    break
+        except Exception as e:
+            logger.warning(f"[Solver] 提取 frame info 失败: {e}")
+
+        logger.info(f"[Solver] 开始打码: sitekey={real_site_key[:20]}... site_url={real_site_url} rqdata={bool(rqdata)}")
+
+        # YesCaptcha 配置
+        YESCAPTCHA_KEY = "27e2aa9da9a236b2a6cfcc3fa0f045fdec2a3633104361"
+        from captcha_solver import CaptchaSolver
+        solver = CaptchaSolver(
+            api_url="https://api.yescaptcha.com",
+            client_key=YESCAPTCHA_KEY,
+        )
+
+        captcha_result = solver.solve_hcaptcha(
+            site_key=real_site_key,
+            site_url=real_site_url,
+            rqdata=rqdata,
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+            ),
+            timeout=120,
+            is_invisible=True,
+        )
+
+        if not captcha_result:
+            logger.error("[Solver] 打码失败")
+            return None
+
+        token = captcha_result["token"]
+        ekey = captcha_result.get("ekey", "")
+        logger.info(f"[Solver] 打码成功, token 长度: {len(token)}, ekey: {bool(ekey)}")
+
+        # 通过 Python requests 调用 verify_challenge (使用正确的 Origin 和 Referer)
+        verify_full_url = f"https://api.stripe.com{verification_url}" if verification_url.startswith("/") else verification_url
+        import requests as req
+        headers = {
+            "Authorization": f"Bearer {stripe_pk}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+            "Origin": "https://js.stripe.com",
+            "Referer": "https://js.stripe.com/",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+            ),
+        }
+        form_data = {
+            "challenge_response_token": token,
+            "challenge_response_ekey": ekey,
+            "key": stripe_pk,
+        }
+        if pi_client_secret:
+            form_data["client_secret"] = pi_client_secret
+
+        # 走代理 (与浏览器一致)
+        proxies = {"https": self.proxy, "http": self.proxy} if self.proxy else None
+        try:
+            resp = req.post(verify_full_url, headers=headers, data=form_data, proxies=proxies, timeout=30)
+            data = resp.json()
+            verify_result = {"status": resp.status_code, "data": data}
+        except Exception as e:
+            verify_result = {"error": str(e)}
+
+        logger.info(f"[Solver] verify_challenge 结果: {json.dumps(verify_result, default=str)[:500]}")
+
+        if not verify_result or verify_result.get("error"):
+            return {"success": False, "error": f"verify_challenge fetch error: {verify_result}", "step": "verify_challenge"}
+
+        status = verify_result.get("status", 0)
+        data = verify_result.get("data", {})
+
+        if status != 200:
+            err_msg = data.get("error", {}).get("message", str(data)[:200])
+            return {"success": False, "error": f"verify_challenge {status}: {err_msg}", "step": "verify_challenge"}
+
+        pi_status = data.get("status", "")
+        logger.info(f"[Solver] verify_challenge 后 PI 状态: {pi_status}")
+
+        if pi_status in ("succeeded", "processing"):
+            return {"success": True, "pi_status": pi_status, "hcaptcha_solved": True}
+        elif pi_status == "requires_action":
+            # 可能需要再来一轮 hCaptcha
+            return {"success": False, "error": f"verify_challenge: still requires_action", "step": "verify_challenge_again"}
+        elif pi_status == "requires_payment_method":
+            # 卡被拒绝
+            last_err = data.get("last_payment_error", {})
+            return {"success": False, "error": f"Card declined: {last_err.get('message', '')}", "step": "card_declined", "hcaptcha_solved": True}
+        else:
+            return {"success": False, "error": f"verify_challenge: pi_status={pi_status}", "step": "verify_challenge"}
+
+    def _try_click_hcaptcha(self, page) -> bool:
+        """
+        检测并自动点击 hCaptcha checkbox。
+        handleNextAction 创建的 hCaptcha 结构:
+        - js.stripe.com/v3/hcaptcha-inner-*.html (sitekey=c7faac4c...)
+          - b.stripecdn.com/.../HCaptcha.html
+            - newassets.hcaptcha.com/...#frame=checkbox (这里有 checkbox!)
+            - newassets.hcaptcha.com/...#frame=challenge
+        使用 page.frames 遍历所有嵌套 frame 定位 checkbox。
+        """
+        for frame in page.frames:
+            url = frame.url
+            # 找到 hCaptcha checkbox frame (frame=checkbox, NOT checkbox-invisible)
+            if "newassets.hcaptcha.com" not in url:
+                continue
+            if "frame=checkbox&" not in url and not url.endswith("frame=checkbox"):
+                continue
+            # 跳过 invisible checkbox
+            if "checkbox-invisible" in url:
+                continue
+
+            logger.info(f"[hCaptcha] 发现 checkbox frame: {url[:80]}...")
+
+            try:
+                # hCaptcha checkbox 的 ID 是 #checkbox
+                checkbox = frame.query_selector('#checkbox')
+                if checkbox:
+                    checkbox.click()
+                    logger.info("[hCaptcha] checkbox 已点击!")
+                    return True
+                # 备选选择器
+                for sel in ['.check', '[role="checkbox"]', '#anchor']:
+                    el = frame.query_selector(sel)
+                    if el:
+                        el.click()
+                        logger.info(f"[hCaptcha] 点击了 {sel}")
+                        return True
+                # 最后尝试: 点击 frame 中心
+                el = frame.query_selector('body')
+                if el:
+                    box = el.bounding_box()
+                    if box:
+                        page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
+                        logger.info("[hCaptcha] 点击了 checkbox frame body 中心")
+                        return True
+            except Exception as e:
+                logger.debug(f"[hCaptcha] checkbox frame 点击失败: {e}")
+
+        return False
 
     @staticmethod
     def _find_chrome_binary() -> str:

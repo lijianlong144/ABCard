@@ -66,8 +66,16 @@ def main():
 
     from browser_payment import BrowserPayment
 
+    # 策略选择:
+    #   --no-proxy   : 浏览器不走代理 (社区经验: 关梯子支付跳过 hCaptcha)
+    #   --proxy      : 浏览器走代理 (默认)
+    no_browser_proxy = "--no-proxy" in flags
+    browser_proxy = None if no_browser_proxy else PROXY
+    strategy = "关梯子支付 (Stripe直连)" if no_browser_proxy else "全代理"
+    logger.info(f"策略: {strategy}")
+
     bp = BrowserPayment(
-        proxy=PROXY,      # 代理 + checkout.stripe.com = 无 hCaptcha
+        proxy=browser_proxy,
         headless=headless,
         slow_mo=80,
     )
@@ -85,7 +93,7 @@ def main():
         billing_zip=BILLING_ZIP,
         billing_line1=BILLING_LINE1,
         billing_email=cred.get("email", ""),
-        chatgpt_proxy=PROXY,      # ChatGPT API 走代理
+        chatgpt_proxy=PROXY,      # ChatGPT API 始终走代理
         timeout=120,
     )
 
